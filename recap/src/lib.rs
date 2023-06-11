@@ -359,13 +359,9 @@ where
     let caps = re.captures(input).ok_or_else(|| {
         envy::Error::Custom(format!("No captures resolved in string '{}'", input))
     })?;
-    from_iter(
-        re.capture_names()
-            .map(|maybe_name| {
-                maybe_name.and_then(|name| caps.name(name).map(|val| (name, val.as_str())))
-            })
-            .flatten(),
-    )
+    from_iter(re.capture_names().filter_map(|maybe_name| {
+        maybe_name.and_then(|name| caps.name(name).map(|val| (name, val.as_str())))
+    }))
 }
 
 #[cfg(test)]

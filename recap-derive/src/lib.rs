@@ -7,8 +7,8 @@ use proc_macro2::Span;
 use quote::quote;
 use regex::Regex;
 use syn::{
-    parse_macro_input, Data::Enum, Data::Struct, DataEnum, DataStruct, DeriveInput, Fields, Ident,
-    Lit, Meta, NestedMeta,
+    parse_macro_input, Attribute, Data::Enum, Data::Struct, DataEnum, DataStruct, DeriveInput,
+    Fields, Ident, Lit, Meta, NestedMeta,
 };
 
 #[proc_macro_derive(Recap, attributes(recap))]
@@ -229,67 +229,78 @@ fn validate(
     regex_container: &Regexes,
 ) {
     match regex_container {
-        Regexes::StructRegex(regex) => {
-            let regex = Regex::new(regex).unwrap_or_else(|err| {
+        Regexes::StructRegex(regex) => validate_struct(item, regex),
+        Regexes::EnumRegexes(regexes) => validate_enum(item, regexes),
+    }
+}
+fn validate_enum(
+    item: &DeriveInput,
+    regexes: &HashMap<String, String>,
+) {
+    if let Enum(DataEnum { variants, .. }) = &item.data {
+        for variant in variants {
+            let variant_name = format!("{}", variant.ident);
+            let regex = Regex::new(regexes.get(&variant_name).unwrap()).unwrap_or_else(|err| {
                 panic!(
                     "Invalid regular expression provided for `{}`\n{}",
                     &item.ident, err
                 )
             });
-            let caps = regex.capture_names().flatten().count();
-            let fields = match &item.data {
-                Struct(DataStruct {
-                    fields: Fields::Named(fs),
-                    ..
-                }) => fs.named.len(),
-                _ => {
-                    panic!("Recap regex can only be applied to Structs and Enums with named fields")
-                }
-            };
-            if caps != fields {
-                panic!(
-                    "Recap could not derive a `FromStr` impl for `{}`.\n\t\t > Expected regex with {} named capture groups to align with struct fields but found {}",
-                    item.ident, fields, caps
-                );
-            }
-        }
-        Regexes::EnumRegexes(regexes) => {
-            match &item.data {
-                Enum(DataEnum { variants, .. }) => {
-                    for variant in variants {
-                        let variant_name = format!("{}", variant.ident);
-                        let regex =
-                            Regex::new(regexes.get(&variant_name).unwrap()).unwrap_or_else(|err| {
-                                panic!(
-                                    "Invalid regular expression provided for `{}`\n{}",
-                                    &item.ident, err
-                                )
-                            });
-                        match &variant.fields {
-                            Fields::Named(_) | Fields::Unnamed(_) => {
-                                let caps = regex.capture_names().flatten().count();
-                                let fields = variant.fields.len();
-                                if caps != fields {
-                                    panic!(
-                                        "Recap could not derive a `FromStr` impl for `{}`.\n\t\t > Expected regex with {} named capture groups to align with struct fields but found {}",
-                                        item.ident, fields, caps
-                                    );
-                                }
-                            }
-                            Fields::Unit => {}
-                        };
+            match &variant.fields {
+                Fields::Named(_) | Fields::Unnamed(_) => {
+                    let caps = regex.capture_names().flatten().count();
+                    let fields = variant.fields.len();
+                    if caps != fields {
+                        panic!(
+                            "Recap could not derive a `FromStr` impl for `{}`.\n\t\t > Expected regex with {} named capture groups to align with struct fields but found {}",
+                            item.ident, fields, caps
+                        );
                     }
                 }
-                _ => {
-                    panic!("Recap regex can only be applied to Structs and Enums with named fields")
-                }
+                Fields::Unit => {}
             };
         }
+    };
+}
+
+fn validate_struct(
+    item: &DeriveInput,
+    regex: &str,
+) {
+    let regex = Regex::new(regex).unwrap_or_else(|err| {
+        panic!(
+            "Invalid regular expression provided for `{}`\n{}",
+            &item.ident, err
+        )
+    });
+    let caps = regex.capture_names().flatten().count();
+    let fields = match &item.data {
+        Struct(DataStruct {
+            fields: Fields::Named(fs),
+            ..
+        }) => fs.named.len(),
+        _ => {
+            panic!("Recap regex can only be applied to Structs and Enums with named fields")
+        }
+    };
+    if caps != fields {
+        panic!(
+            "Recap could not derive a `FromStr` impl for `{}`.\n\t\t > Expected regex with {} named capture groups to align with struct fields but found {}",
+            item.ident, fields, caps
+        );
     }
 }
 
-fn extract_struct_regex(item: &DeriveInput) -> Option<String> {
-    item.attrs
+fn extract_regex(item: &DeriveInput) -> Option<Regexes> {
+    match &item.data {
+        Struct(_) => extract_regex_from_recap_attribute(&item.attrs).map(Regexes::StructRegex),
+        Enum(data_enum) => Some(Regexes::EnumRegexes(extract_enum_regexes(data_enum))),
+        _ => None,
+    }
+}
+
+fn extract_regex_from_recap_attribute(attrs: &[Attribute]) -> Option<String> {
+    attrs
         .iter()
         .flat_map(syn::Attribute::parse_meta)
         .filter_map(|x| match x {
@@ -318,39 +329,8 @@ fn extract_enum_regexes(data_enum: &DataEnum) -> HashMap<String, String> {
         .variants
         .iter()
         .map(|variant| {
-            let regex = variant
-                .attrs
-                .iter()
-                .flat_map(syn::Attribute::parse_meta)
-                .filter_map(|x| match x {
-                    Meta::List(y) => Some(y),
-                    _ => None,
-                })
-                .filter(|x| x.path.is_ident("recap"))
-                .flat_map(|x| x.nested.into_iter())
-                .filter_map(|x| match x {
-                    NestedMeta::Meta(y) => Some(y),
-                    _ => None,
-                })
-                .filter_map(|x| match x {
-                    Meta::NameValue(y) => Some(y),
-                    _ => None,
-                })
-                .find(|x| x.path.is_ident("regex"))
-                .and_then(|x| match x.lit {
-                    Lit::Str(y) => Some(y.value()),
-                    _ => None,
-                })
-                .unwrap();
+            let regex = extract_regex_from_recap_attribute(&variant.attrs).unwrap();
             (format!("{}", variant.ident), regex)
         })
         .collect()
-}
-
-fn extract_regex(item: &DeriveInput) -> Option<Regexes> {
-    match &item.data {
-        Struct(_) => extract_struct_regex(item).map(Regexes::StructRegex),
-        Enum(data_enum) => Some(Regexes::EnumRegexes(extract_enum_regexes(data_enum))),
-        _ => None,
-    }
 }
