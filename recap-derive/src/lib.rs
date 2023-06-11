@@ -7,8 +7,8 @@ use proc_macro2::Span;
 use quote::quote;
 use regex::Regex;
 use syn::{
-    parse_macro_input, Data::Enum, Data::Struct, DataEnum, DataStruct, DeriveInput, Fields,
-    FieldsUnnamed, Ident, Lit, Meta, NestedMeta, Variant,
+    parse_macro_input, Data::Enum, Data::Struct, DataEnum, DataStruct, DeriveInput, Fields, Ident,
+    Lit, Meta, NestedMeta,
 };
 
 #[proc_macro_derive(Recap, attributes(recap))]
@@ -29,7 +29,7 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
 
     let has_lifetimes = item.generics.lifetimes().count() > 0;
-    let out = match regex {
+    let (impl_inner, impl_matcher) = match regex {
         Regexes::StructRegex(regex) => {
             let impl_from_str = if !has_lifetimes {
                 quote! {
@@ -79,19 +79,7 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
                     }
                 }
             };
-
-            let injector = Ident::new(
-                &format!("RECAP_IMPL_FOR_{}", item.ident.to_string()),
-                Span::call_site(),
-            );
-
-            quote! {
-                const #injector: () = {
-                    extern crate recap;
-                    #impl_inner
-                    #impl_matcher
-                };
-            }
+            (impl_inner, impl_matcher)
         }
         Regexes::EnumRegexes(regexes) => {
             let data_enum = match item.data {
@@ -99,39 +87,40 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
                 _ => panic!("expected Enum"),
             };
 
-            let impl_from_str = if !has_lifetimes {
-                let from_str_regexes = regexes.iter().map(|(variant_name, regex)| {
-                    let regex_name_injector = Ident::new(
-                        &format!("RE_{}", variant_name),
-                        Span::call_site(),
-                    );
+            let build_regex_name_ident = |variant_name: String| {
+                Ident::new(&format!("RE_{}", variant_name), Span::call_site())
+            };
+
+            let static_regexes: Vec<_> = regexes
+                .iter()
+                .map(|(variant_name, regex)| {
+                    let regex_name = build_regex_name_ident(variant_name.to_string());
                     quote! {
-                            static ref #regex_name_injector: recap::Regex = recap::Regex::new(#regex)
+                            static ref #regex_name: recap::Regex = recap::Regex::new(#regex)
                                 .expect("Failed to compile regex");
                     }
-                });
+                })
+                .collect();
 
-                let try_parse_regexes = data_enum.variants.iter().map(|variant| {
+            let parsers =
+                data_enum.variants.iter().map(|variant| {
                     let variant_name = &variant.ident;
                     let name = &item.ident;
-                    let regex_name_injector = Ident::new(
-                        &format!("RE_{}", variant_name),
-                        Span::call_site(),
-                    );
+                    let regex_name = build_regex_name_ident(variant_name.to_string());
                     match &variant.fields {
                         Fields::Named(fields) => {
                             let fields: Vec<Ident> = fields.named.iter().map(|f| f.ident.clone().unwrap()).collect();
                             quote! {
-                                if let Some(caps) = #regex_name_injector.captures(&s) {
+                                if let Some(caps) = #regex_name.captures(&s) {
                                     return Ok(#name::#variant_name {
-                                        #(#fields: caps.name(stringify!(#fields)).unwrap().as_str().try_into().unwrap(),)*
+                                        #(#fields: caps.name(stringify!(#fields)).unwrap().as_str().parse().unwrap(),)*
                                     })
                                 }
                             }
                         }
                         Fields::Unnamed(_) => {
                             quote! {
-                                if let Some(caps) = #regex_name_injector.captures(&s) {
+                                if let Some(caps) = #regex_name.captures(&s) {
                                     let inner = caps.get(1).unwrap().as_str();
                                     if let Ok(value) = inner.parse() {
                                         return Ok(#name::#variant_name(value))
@@ -141,22 +130,32 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
                         }
                         Fields::Unit => {
                             quote! {
-                                if #regex_name_injector.is_match(&s) {
+                                if #regex_name.is_match(&s) {
                                     return Ok(#name::#variant_name)
                                 }
                             }
                         }
-                }});
+                }}).collect::<Vec<_>>();
 
+            let matchers = regexes.keys().map(|variant_name| {
+                let regex = build_regex_name_ident(variant_name.to_string());
+                quote! {
+                    if #regex.is_match(input) {
+                        return true;
+                    };
+                }
+            });
+
+            let impl_from_str = if !has_lifetimes {
                 quote! {
                     impl #impl_generics std::str::FromStr for #item_ident #ty_generics #where_clause {
                         type Err = recap::Error;
                         fn from_str(s: &str) -> Result<Self, Self::Err> {
                             recap::lazy_static! {
-                                #(#from_str_regexes)*
+                                #(#static_regexes)*
                             }
 
-                            #(#try_parse_regexes)*
+                            #(#parsers)*
 
                             Err(Self::Err::Custom("Uh Oh".to_string()))
                         }
@@ -169,62 +168,14 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
             let lifetimes = item.generics.lifetimes();
             let also_lifetimes = item.generics.lifetimes();
             let impl_inner = {
-                let from_str_regexes = regexes.iter().map(|(variant_name, regex)| {
-                    let regex_name_injector = Ident::new(
-                        &format!("RE_{}", variant_name),
-                        Span::call_site(),
-                    );
-                    quote! {
-                            static ref #regex_name_injector: recap::Regex = recap::Regex::new(&#regex)
-                                .expect("Failed to compile regex");
-                    }
-                });
-
-                let try_parse_regexes = data_enum.variants.iter().map(|variant| {
-                    let variant_name = &variant.ident;
-                    let name = &item.ident;
-                    let regex_name_injector = Ident::new(
-                        &format!("RE_{}", variant_name),
-                        Span::call_site(),
-                    );
-                    match &variant.fields {
-                        Fields::Named(fields) => {
-                            let fields: Vec<Ident> = fields.named.iter().map(|f| f.ident.clone().unwrap()).collect();
-                            quote! {
-                                if let Some(caps) = #regex_name_injector.captures(&s) {
-                                    return Ok(#name::#variant_name {
-                                        #(#fields: caps.name(stringify!(#fields)).unwrap().as_str().try_into().unwrap(),)*
-                                    })
-                                }
-                            }
-                        }
-                        Fields::Unnamed(_) => {
-                            quote! {
-                                if let Some(caps) = #regex_name_injector.captures(&s) {
-                                    let inner = caps.get(1).unwrap().as_str();
-                                    if let Ok(value) = inner.parse() {
-                                        return Ok(#name::#variant_name(value))
-                                    }
-                                }
-                            }
-                        }
-                        Fields::Unit => {
-                            quote! {
-                                if #regex_name_injector.is_match(&s) {
-                                    return Ok(#name::#variant_name)
-                                }
-                            }
-                        }
-                }});
-
                 quote! {
                     impl #impl_generics std::convert::TryFrom<& #(#lifetimes)* str> for #item_ident #ty_generics #where_clause {
                         type Error = recap::Error;
                         fn try_from(s: & #(#also_lifetimes)* str) -> Result<Self, Self::Error> {
                             recap::lazy_static! {
-                                #(#from_str_regexes)*
+                                #(#static_regexes)*
                             }
-                            #(#try_parse_regexes)*
+                            #(#parsers)*
 
                             Err(Self::Error::Custom("Uh Oh".to_string()))
                         }
@@ -232,35 +183,15 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
                     #impl_from_str
                 }
             };
+
             let impl_matcher = {
-                let from_str_regexes = regexes.iter().map(|(variant_name, regex)| {
-                    let regex_name_injector = Ident::new(
-                        &format!("RE_{}", variant_name),
-                        Span::call_site(),
-                    );
-                    quote! {
-                            static ref #regex_name_injector: recap::Regex = recap::Regex::new(#regex)
-                                .expect("Failed to compile regex");
-                    }
-                });
-
-                let matchers = regexes.iter().map(|(variant_name, regex)| {
-                    let regex_name_injector =
-                        Ident::new(&format!("RE_{}", variant_name), Span::call_site());
-                    quote! {
-                        if #regex_name_injector.is_match(input) {
-                            return true;
-                        };
-                    }
-                });
-
                 quote! {
                 impl #impl_generics  #item_ident #ty_generics #where_clause {
                     /// Recap derived method. Returns true when some input text
                     /// matches the regex associated with this type
                     pub fn is_match(input: &str) -> bool {
                             recap::lazy_static! {
-                                #(#from_str_regexes)*
+                                #(#static_regexes)*
                             }
                             #(#matchers)*
                             false
@@ -269,22 +200,22 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
                 }
             };
 
-            let injector = Ident::new(
-                &format!("RECAP_IMPL_FOR_{}", item.ident.to_string()),
-                Span::call_site(),
-            );
-
-            quote! {
-                const #injector: () = {
-                    extern crate recap;
-                    #impl_inner
-                    #impl_matcher
-                };
-            }
+            (impl_inner, impl_matcher)
         }
-        _ => panic!("Made it this far"),
     };
 
+    let injector = Ident::new(
+        &format!("RECAP_IMPL_FOR_{}", item.ident.to_string().to_uppercase()),
+        Span::call_site(),
+    );
+
+    let out = quote! {
+        const #injector: () = {
+            extern crate recap;
+            #impl_inner
+            #impl_matcher
+        };
+    };
     out.into()
 }
 
