@@ -157,7 +157,7 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
 
                             #(#parsers)*
 
-                            Err(Self::Err::Custom("Uh Oh".to_string()))
+                            Err(Self::Err::Custom("Unable to parse command".to_string()))
                         }
                     }
                 }
@@ -177,7 +177,7 @@ pub fn derive_recap(item: TokenStream) -> TokenStream {
                             }
                             #(#parsers)*
 
-                            Err(Self::Error::Custom("Uh Oh".to_string()))
+                            Err(Self::Error::Custom("Unable to parse command".to_string()))
                         }
                     }
                     #impl_from_str
